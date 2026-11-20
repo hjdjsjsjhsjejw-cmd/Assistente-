@@ -1,0 +1,292 @@
+name: Build APK
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: "8.7" }
+      - name: Criar projeto
+        run: |
+          mkdir -p proj && cd proj
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.meu.assistente"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.meu.assistente"; minSdk = 29; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <queries><intent><action android:name="android.speech.RecognitionService"/></intent></queries>
+              <application android:label="Assistente" android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".ChatActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".OverlayService" android:exported="false" android:foregroundServiceType="microphone"/>
+                  <service android:name=".AssistService" android:exported="true"
+                      android:permission="android.permission.BIND_VOICE_INTERACTION">
+                      <meta-data android:name="android.voice_interaction" android:resource="@xml/interaction"/>
+                      <intent-filter><action android:name="android.service.voice.VoiceInteractionService"/></intent-filter>
+                  </service>
+                  <service android:name=".SessionService" android:exported="true"
+                      android:permission="android.permission.BIND_VOICE_INTERACTION"/>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/meu/assistente
+          cat > app/src/main/java/com/meu/assistente/Assist.kt <<'EOF_FILE'
+          package com.meu.assistente
+
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Bundle
+          import android.service.voice.*
+
+          class AssistService : VoiceInteractionService()
+
+          class SessionService : VoiceInteractionSessionService() {
+              override fun onNewSession(args: Bundle?) = Session(this)
+          }
+
+          class Session(ctx: Context) : VoiceInteractionSession(ctx) {
+              override fun onShow(args: Bundle?, flags: Int) {
+                  super.onShow(args, flags)
+                  context.startForegroundService(Intent(context, OverlayService::class.java))
+                  hide()
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/meu/assistente
+          cat > app/src/main/java/com/meu/assistente/ChatActivity.kt <<'EOF_FILE'
+          package com.meu.assistente
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.Color
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.widget.*
+
+          const val PERSONA = "Você é uma assistente de voz no estilo da Siri: educada, direta e com humor leve e sutil, às vezes um pouco irônica, nunca ofensiva. Responda em português do Brasil, em uma ou duas frases curtas, porque a resposta será falada em voz alta. Chame o usuário pelo nome de vez em quando, sem exagerar. Se não souber algo, diga isso com simpatia e uma pitada de humor."
+
+          class ChatActivity : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 48); setBackgroundColor(Color.parseColor("#14161A")) }
+                  fun label(s: String) = TextView(this).apply { text = s; setTextColor(Color.WHITE); textSize = 16f; setPadding(0, 32, 0, 8) }
+                  val key = EditText(this).apply { hint = "Chave da API (sk-ant-...)"; setText(prefs.getString("key", "")); inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD; setTextColor(Color.WHITE); setHintTextColor(Color.GRAY) }
+                  val model = EditText(this).apply { setText(prefs.getString("model", "claude-sonnet-5-5")); setTextColor(Color.WHITE) }
+                  val nome = EditText(this).apply { hint = "Como devo te chamar?"; setText(prefs.getString("nome", "")); setTextColor(Color.WHITE); setHintTextColor(Color.GRAY) }
+                  val persona = EditText(this).apply { setText(prefs.getString("persona", PERSONA)); setTextColor(Color.WHITE); minLines = 4 }
+                  val tom = EditText(this).apply { setText(prefs.getString("tom", "0.8")); inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL; setTextColor(Color.WHITE) }
+                  fun btn(s: String, f: () -> Unit) = Button(this).apply { text = s; setOnClickListener { f() } }
+                  root.addView(label("Configurações")); root.addView(key); root.addView(model)
+                  root.addView(label("Seu nome")); root.addView(nome)
+                  root.addView(label("Tom da voz (0.5 = bem grossa, 1.0 = normal)")); root.addView(tom)
+                  root.addView(btn("Escolher ou baixar outra voz") { try { startActivity(Intent("com.android.settings.TTS_SETTINGS")) } catch (e: Exception) { startActivity(Intent(Settings.ACTION_SETTINGS)) } })
+                  root.addView(label("Jeito de falar (pode editar)")); root.addView(persona)
+                  root.addView(btn("Salvar") { prefs.edit().putString("key", key.text.toString().trim()).putString("model", model.text.toString().trim()).putString("tom", tom.text.toString().trim()).putString("nome", nome.text.toString().trim()).putString("persona", persona.text.toString().trim()).apply(); Toast.makeText(this, "Salvo", Toast.LENGTH_SHORT).show() })
+                  root.addView(label("Permissões"))
+                  root.addView(btn("1. Permitir bolinha sobre outros apps") { startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))) })
+                  root.addView(btn("2. Permitir microfone e notificações") { requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS), 1) })
+                  root.addView(label("Teste"))
+                  root.addView(btn("Mostrar bolinha agora") { startForegroundService(Intent(this, OverlayService::class.java)) })
+                  setContentView(ScrollView(this).apply { addView(root) })
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/meu/assistente
+          cat > app/src/main/java/com/meu/assistente/OverlayService.kt <<'EOF_FILE'
+          package com.meu.assistente
+
+          import android.animation.ValueAnimator
+          import android.app.*
+          import android.content.*
+          import android.content.pm.ServiceInfo
+          import android.graphics.*
+          import android.graphics.drawable.GradientDrawable
+          import android.os.*
+          import android.provider.Settings
+          import android.speech.*
+          import android.speech.tts.*
+          import android.view.*
+          import android.widget.*
+          import org.json.*
+          import java.net.*
+          import java.util.Locale
+
+          class Pulse(c: Context) : View(c) {
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val d = resources.displayMetrics.density
+              private var t = 0f
+              private val anim = ValueAnimator.ofFloat(0f, 1f).apply {
+                  duration = 1300; repeatCount = ValueAnimator.INFINITE
+                  addUpdateListener { t = it.animatedValue as Float; invalidate() }
+              }
+              init { anim.start() }
+              override fun onMeasure(w: Int, h: Int) { val s = (88 * d).toInt(); setMeasuredDimension(s, s) }
+              override fun onDetachedFromWindow() { anim.cancel(); super.onDetachedFromWindow() }
+              override fun onDraw(c: Canvas) {
+                  val cx = width / 2f; val cy = height / 2f
+                  p.style = Paint.Style.STROKE; p.strokeWidth = 3 * d
+                  p.color = Color.argb(((1 - t) * 210).toInt(), 80, 160, 255)
+                  c.drawCircle(cx, cy, (14 + 28 * t) * d, p)
+                  p.style = Paint.Style.FILL; p.color = Color.rgb(60, 140, 255)
+                  c.drawCircle(cx, cy, 14 * d, p)
+              }
+          }
+
+          class OverlayService : Service() {
+              companion object { var running = false }
+              private val h = Handler(Looper.getMainLooper())
+              private val history = JSONArray()
+              private var wm: WindowManager? = null
+              private var root: LinearLayout? = null
+              private lateinit var card: TextView
+              private var sr: SpeechRecognizer? = null
+              private var tts: TextToSpeech? = null
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("a", "Assistente", NotificationManager.IMPORTANCE_LOW))
+                  startForeground(1, Notification.Builder(this, "a").setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setContentTitle("Assistente ativo").build(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                  if (running || !Settings.canDrawOverlays(this)) { stopSelf(); return START_NOT_STICKY }
+                  running = true
+                  val d = resources.displayMetrics.density
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  card = TextView(this).apply {
+                      setTextColor(Color.WHITE); textSize = 15f; maxWidth = (300 * d).toInt(); visibility = View.GONE
+                      setPadding((14 * d).toInt(), (10 * d).toInt(), (14 * d).toInt(), (10 * d).toInt())
+                      background = GradientDrawable().apply { setColor(Color.argb(235, 20, 24, 32)); cornerRadius = 16 * d }
+                  }
+                  val bubble = Pulse(this).apply { setOnClickListener { stopSelf() } }
+                  root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL; addView(card); addView(bubble) }
+                  val lp = WindowManager.LayoutParams(-2, -2, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                      PixelFormat.TRANSLUCENT).apply { gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL; y = (24 * d).toInt() }
+                  wm!!.addView(root, lp)
+
+                  tts = TextToSpeech(this) {
+                      tts?.language = Locale("pt", "BR")
+                      tts?.setPitch(getSharedPreferences("cfg", MODE_PRIVATE).getString("tom", "0.8")?.toFloatOrNull()?.coerceIn(0.3f, 2f) ?: 0.8f)
+                  }
+                  tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                      override fun onStart(u: String?) {}
+                      override fun onError(u: String?) { h.post { listen() } }
+                      override fun onDone(u: String?) { h.post { listen() } }
+                  })
+                  sr = SpeechRecognizer.createSpeechRecognizer(this)
+                  sr!!.setRecognitionListener(object : RecognitionListener {
+                      override fun onReadyForSpeech(p: Bundle?) {}
+                      override fun onBeginningOfSpeech() {}
+                      override fun onRmsChanged(v: Float) {}
+                      override fun onBufferReceived(b: ByteArray?) {}
+                      override fun onEndOfSpeech() {}
+                      override fun onPartialResults(b: Bundle?) {}
+                      override fun onEvent(t: Int, b: Bundle?) {}
+                      override fun onError(e: Int) {
+                          if (e == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) { say("Dê permissão do microfone no app."); return }
+                          h.postDelayed({ listen() }, 800)
+                      }
+                      override fun onResults(b: Bundle?) {
+                          val t = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                          if (t.isNullOrBlank()) listen() else ask(t)
+                      }
+                  })
+                  listen()
+                  return START_NOT_STICKY
+              }
+
+              private fun listen() {
+                  if (!running) return
+                  sr?.startListening(Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                      .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                      .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "pt-BR"))
+              }
+
+              private fun say(s: String) {
+                  card.text = s; card.visibility = View.VISIBLE
+                  h.removeCallbacks(hide); h.postDelayed(hide, 12000)
+              }
+              private val hide = Runnable { card.visibility = View.GONE }
+
+              private fun ask(text: String) {
+                  val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
+                  history.put(JSONObject().put("role", "user").put("content", text))
+                  Thread {
+                      val out = try {
+                          val c = URL("https://api.anthropic.com/v1/messages").openConnection() as HttpURLConnection
+                          c.requestMethod = "POST"; c.doOutput = true
+                          c.setRequestProperty("x-api-key", prefs.getString("key", ""))
+                          c.setRequestProperty("anthropic-version", "2023-06-01")
+                          c.setRequestProperty("content-type", "application/json")
+                          val body = JSONObject().put("model", prefs.getString("model", "claude-sonnet-5-5")).put("max_tokens", 400)
+                              .put("system", prefs.getString("persona", PERSONA) + (prefs.getString("nome", "")!!.let { if (it.isBlank()) "" else " O nome do usuário é $it." }))
+                              .put("messages", history)
+                          c.outputStream.use { it.write(body.toString().toByteArray()) }
+                          val ok = c.responseCode in 200..299
+                          val r = (if (ok) c.inputStream else c.errorStream).bufferedReader().readText()
+                          if (ok) JSONObject(r).getJSONArray("content").getJSONObject(0).getString("text") else "Erro: $r"
+                      } catch (e: Exception) { "Erro: ${e.message}" }
+                      history.put(JSONObject().put("role", "assistant").put("content", out))
+                      h.post { if (running) { say(out); tts?.speak(out, TextToSpeech.QUEUE_FLUSH, null, "r") } }
+                  }.start()
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  h.removeCallbacksAndMessages(null)
+                  sr?.destroy(); tts?.shutdown()
+                  try { wm?.removeView(root) } catch (e: Exception) {}
+                  super.onDestroy()
+              }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/interaction.xml <<'EOF_FILE'
+          <voice-interaction-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:sessionService="com.meu.assistente.SessionService"
+              android:supportsAssist="true"/>
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          android.useAndroidX=true
+          EOF_FILE
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "assistente"
+          include(":app")
+          EOF_FILE
+      - run: cd proj && gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with: { name: assistente-apk, path: proj/app/build/outputs/apk/debug/app-debug.apk }
